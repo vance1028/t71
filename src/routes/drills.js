@@ -104,13 +104,24 @@ router.get('/drills/:drillId/tasks', wrap(async (req, res) => {
   if (!(await store.getDrill(drillId))) return sendError(res, 404, '演练不存在');
 
   const drillTasks = await store.listDrillTasks(drillId);
+  const taskIdToName = new Map();
+  for (const dt of drillTasks) {
+    const snapshotTask = dt.taskSnapshot?.task;
+    if (snapshotTask) {
+      taskIdToName.set(dt.taskId, snapshotTask.name);
+    }
+  }
+
   const enriched = [];
   for (const dt of drillTasks) {
-    const prereqs = await store.listTaskPrerequisites(dt.taskId);
+    const snapshotTask = dt.taskSnapshot?.task || {};
+    const prerequisiteNames = (snapshotTask.prerequisiteTaskIds || [])
+      .map((pid) => taskIdToName.get(pid) || `作业#${pid}`)
+      .filter(Boolean);
     const prereqCheck = await store.checkPrerequisitesMet(drillId, dt.taskId);
     enriched.push({
       ...dt,
-      prerequisiteNames: prereqs.map((p) => p.name),
+      prerequisiteNames,
       canStart: prereqCheck.met,
       uncompletedPrerequisites: prereqCheck.uncompleted || [],
     });
@@ -126,15 +137,30 @@ router.get('/drills/:drillId/tasks/:taskId', wrap(async (req, res) => {
   const dt = await store.getDrillTaskByDrillAndTask(drillId, taskId);
   if (!dt) return sendError(res, 404, '演练作业不存在');
 
-  const prereqs = await store.listTaskPrerequisites(taskId);
-  const equips = await store.listTaskEquipments(taskId);
+  const drillTasks = await store.listDrillTasks(drillId);
+  const taskIdToName = new Map();
+  for (const d of drillTasks) {
+    const snapshotTask = d.taskSnapshot?.task;
+    if (snapshotTask) {
+      taskIdToName.set(d.taskId, snapshotTask.name);
+    }
+  }
+
+  const snapshotTask = dt.taskSnapshot?.task || {};
+  const prerequisiteNames = (snapshotTask.prerequisiteTaskIds || [])
+    .map((pid) => taskIdToName.get(pid) || `作业#${pid}`)
+    .filter(Boolean);
+  const equipments = (snapshotTask.equipments || []).map((e) => ({
+    equipmentId: e.equipmentId,
+    actionNote: e.actionNote || '',
+  }));
   const prereqCheck = await store.checkPrerequisitesMet(drillId, taskId);
 
   res.json({
     data: {
       ...dt,
-      prerequisiteNames: prereqs.map((p) => p.name),
-      equipments: equips,
+      prerequisiteNames,
+      equipments,
       canStart: prereqCheck.met,
       uncompletedPrerequisites: prereqCheck.uncompleted || [],
     },

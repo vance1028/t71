@@ -8,6 +8,17 @@
 const { pool } = require('../db');
 const { hashPassword } = require('../utils/password');
 
+/**
+ * 解析数据库返回的日期字符串为 Date 对象。
+ * 数据库配置 timezone: 'Z' + dateStrings: true 返回的是 UTC 时间字符串（无时区标识），
+ * 需要手动加上 'Z' 才能被 new Date 正确解析为 UTC 时间。
+ */
+function parseDbDate(dateStr) {
+  if (!dateStr) return null;
+  if (dateStr instanceof Date) return dateStr;
+  return new Date(dateStr + 'Z');
+}
+
 /* ----------------------------- 映射 ----------------------------- */
 
 function mapUser(r) {
@@ -490,30 +501,79 @@ async function getPlanVersion(versionId) {
 }
 
 async function createPlanVersion({ planId, changeSummary, createdBy }) {
-  const tasks = await listTasksByVersion((await getLatestVersion(planId))?.id || 0);
-  const tasksWithDetails = [];
-  for (const t of tasks) {
-    const deps = await listTaskDependencies(t.id);
-    const equips = await listTaskEquipments(t.id);
-    tasksWithDetails.push({
-      ...t,
-      dependencies: deps.map((d) => d.prerequisiteTaskId),
-      equipments: equips.map((e) => ({ equipmentId: e.equipmentId, actionNote: e.actionNote })),
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const latest = await getLatestVersion(planId);
+    const oldVersionId = latest ? latest.id : 0;
+    const nextVersion = latest ? latest.version + 1 : 1;
+
+    const oldTasks = await listTasksByVersion(oldVersionId);
+    const tasksWithDetails = [];
+    for (const t of oldTasks) {
+      const deps = await listTaskDependencies(t.id);
+      const equips = await listTaskEquipments(t.id);
+      tasksWithDetails.push({
+        ...t,
+        dependencies: deps.map((d) => d.prerequisiteTaskId),
+        equipments: equips.map((e) => ({ equipmentId: e.equipmentId, actionNote: e.actionNote })),
+      });
+    }
+
+    const snapshot = JSON.stringify({
+      planName: (await getPlan(planId)).name,
+      tasks: tasksWithDetails,
+      generatedAt: new Date().toISOString(),
     });
+
+    const [vr] = await conn.query(
+      `INSERT INTO conversion_plan_versions (plan_id, version, change_summary, snapshot, created_by)
+       VALUES (?, ?, ?, ?, ?)`,
+      [planId, nextVersion, changeSummary || '', snapshot, createdBy || null],
+    );
+    const newVersionId = vr.insertId;
+
+    const oldToNewTaskId = new Map();
+    for (const t of oldTasks) {
+      const [tr] = await conn.query(
+        `INSERT INTO conversion_tasks (plan_version_id, name, description, sort_order, time_limit_minutes, responsible_user_id, responsible_team)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [newVersionId, t.name, t.description, t.sortOrder, t.timeLimitMinutes,
+          t.responsibleUserId || null, t.responsibleTeam || ''],
+      );
+      oldToNewTaskId.set(t.id, tr.insertId);
+    }
+
+    for (const t of oldTasks) {
+      const newTaskId = oldToNewTaskId.get(t.id);
+      const deps = await listTaskDependencies(t.id);
+      for (const d of deps) {
+        const newPrereqId = oldToNewTaskId.get(d.prerequisiteTaskId);
+        if (newPrereqId) {
+          await conn.query(
+            'INSERT INTO conversion_task_dependencies (task_id, prerequisite_task_id) VALUES (?, ?)',
+            [newTaskId, newPrereqId],
+          );
+        }
+      }
+      const equips = await listTaskEquipments(t.id);
+      for (const e of equips) {
+        await conn.query(
+          'INSERT INTO conversion_task_equipments (task_id, equipment_id, action_note) VALUES (?, ?, ?)',
+          [newTaskId, e.equipmentId, e.actionNote || ''],
+        );
+      }
+    }
+
+    await conn.commit();
+    return getPlanVersion(newVersionId);
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
   }
-  const latest = await getLatestVersion(planId);
-  const nextVersion = latest ? latest.version + 1 : 1;
-  const snapshot = JSON.stringify({
-    planName: (await getPlan(planId)).name,
-    tasks: tasksWithDetails,
-    generatedAt: new Date().toISOString(),
-  });
-  const [r] = await pool.query(
-    `INSERT INTO conversion_plan_versions (plan_id, version, change_summary, snapshot, created_by)
-     VALUES (?, ?, ?, ?, ?)`,
-    [planId, nextVersion, changeSummary || '', snapshot, createdBy || null],
-  );
-  return getPlanVersion(r.insertId);
 }
 
 /* ---------- 作业项 ---------- */
@@ -745,15 +805,31 @@ async function getDrillTaskByDrillAndTask(drillId, taskId) {
 /* ---------- 依赖检查 ---------- */
 
 async function checkPrerequisitesMet(drillId, taskId) {
-  const deps = await listTaskDependencies(taskId);
-  if (deps.length === 0) return { met: true };
   const drillTasks = await listDrillTasks(drillId);
+
+  const taskIdToName = new Map();
+  for (const d of drillTasks) {
+    const snapshotTask = d.taskSnapshot?.task;
+    if (snapshotTask) {
+      taskIdToName.set(d.taskId, snapshotTask.name);
+    }
+  }
+
+  const thisTask = drillTasks.find((d) => d.taskId === taskId);
+  const snapshotTask = thisTask?.taskSnapshot?.task;
+  const prerequisiteTaskIds = snapshotTask?.prerequisiteTaskIds || [];
+
+  if (prerequisiteTaskIds.length === 0) return { met: true };
+
   const uncompleted = [];
-  for (const dep of deps) {
-    const dt = drillTasks.find((d) => d.taskId === dep.prerequisiteTaskId);
+  for (const preTaskId of prerequisiteTaskIds) {
+    const dt = drillTasks.find((d) => d.taskId === preTaskId);
     if (!dt || dt.status !== 'COMPLETED') {
-      const preTask = await getTask(dep.prerequisiteTaskId);
-      uncompleted.push({ taskId: dep.prerequisiteTaskId, taskName: preTask?.name, status: dt?.status });
+      uncompleted.push({
+        taskId: preTaskId,
+        taskName: taskIdToName.get(preTaskId) || `作业#${preTaskId}`,
+        status: dt?.status,
+      });
     }
   }
   return { met: uncompleted.length === 0, uncompleted };
@@ -846,9 +922,9 @@ async function finishDrillTask(drillId, taskId, reportedBy, remarks) {
     if (dt.status !== 'IN_PROGRESS') { await conn.rollback(); throw new Error('作业未在进行中'); }
 
     const now = new Date();
-    const startedAt = new Date(dt.started_at);
+    const startedAt = parseDbDate(dt.started_at);
     const durationMs = now - startedAt;
-    const durationMinutes = Math.ceil(durationMs / 60000);
+    const durationMinutes = Math.max(1, Math.ceil(durationMs / 60000));
     const isOvertime = durationMinutes > dt.time_limit_minutes;
 
     const nowStr = now.toISOString().slice(0, 23).replace('T', ' ');
@@ -863,9 +939,9 @@ async function finishDrillTask(drillId, taskId, reportedBy, remarks) {
       [drillId],
     );
     if (remainingRows[0].cnt === 0) {
-      const totalStart = new Date(drill.started_at);
+      const totalStart = parseDbDate(drill.started_at);
       const totalDurationMs = now - totalStart;
-      const totalDurationMinutes = Math.ceil(totalDurationMs / 60000);
+      const totalDurationMinutes = Math.max(1, Math.ceil(totalDurationMs / 60000));
       await conn.query(
         `UPDATE drills SET status = 'COMPLETED', finished_at = ?, total_duration_minutes = ? WHERE id = ?`,
         [nowStr, totalDurationMinutes, drillId],
@@ -922,13 +998,13 @@ async function getDrillProgress(drillId) {
 
   const now = new Date();
   const currentElapsedMinutes = drill.status === 'IN_PROGRESS' && drill.startedAt
-    ? Math.ceil((now - new Date(drill.startedAt)) / 60000)
+    ? Math.max(1, Math.ceil((now - parseDbDate(drill.startedAt)) / 60000))
     : (drill.totalDurationMinutes || 0);
 
   const overtimeTasks = drillTasks.filter((t) => {
     if (t.status === 'COMPLETED') return t.isOvertime;
     if (t.status === 'IN_PROGRESS' && t.startedAt) {
-      const elapsed = Math.ceil((now - new Date(t.startedAt)) / 60000);
+      const elapsed = Math.max(1, Math.ceil((now - parseDbDate(t.startedAt)) / 60000));
       return elapsed > t.timeLimitMinutes;
     }
     return false;
@@ -955,17 +1031,19 @@ async function getDrillProgress(drillId) {
 
 async function findCriticalPath(drillId) {
   const drillTasks = await listDrillTasks(drillId);
-  const structure = await getPlanFullStructure(drillTasks[0]?.taskSnapshot?.planVersionId);
-  if (!structure) return null;
+  if (drillTasks.length === 0) return null;
 
   const taskMap = new Map();
-  for (const t of structure.tasks) {
-    const dt = drillTasks.find((d) => d.taskId === t.id);
-    taskMap.set(t.id, {
-      ...t,
-      duration: dt?.durationMinutes || t.timeLimitMinutes,
-      status: dt?.status,
-      isOvertime: dt?.isOvertime,
+  for (const dt of drillTasks) {
+    const snapshotTask = dt.taskSnapshot?.task || {};
+    taskMap.set(dt.taskId, {
+      id: dt.taskId,
+      name: snapshotTask.name || `作业#${dt.taskId}`,
+      timeLimitMinutes: snapshotTask.timeLimitMinutes || dt.timeLimitMinutes,
+      prerequisiteTaskIds: snapshotTask.prerequisiteTaskIds || [],
+      duration: dt.durationMinutes || (snapshotTask.timeLimitMinutes ?? dt.timeLimitMinutes),
+      status: dt.status,
+      isOvertime: dt.isOvertime,
     });
   }
 
@@ -1025,14 +1103,29 @@ async function getDrillReport(drillId) {
   const progress = await getDrillProgress(drillId);
   const critical = await findCriticalPath(drillId);
 
+  const taskIdToName = new Map();
+  for (const dt of drillTasks) {
+    const snapshotTask = dt.taskSnapshot?.task;
+    if (snapshotTask) {
+      taskIdToName.set(dt.taskId, snapshotTask.name);
+    }
+  }
+
   const taskDetails = [];
   for (const dt of drillTasks) {
-    const prereqs = await listTaskPrerequisites(dt.taskId);
-    const equips = await listTaskEquipments(dt.taskId);
+    const snapshotTask = dt.taskSnapshot?.task || {};
+    const prerequisiteNames = (snapshotTask.prerequisiteTaskIds || [])
+      .map((pid) => taskIdToName.get(pid) || `作业#${pid}`)
+      .filter(Boolean);
+    const equipments = (snapshotTask.equipments || []).map((e) => ({
+      equipmentId: e.equipmentId,
+      actionNote: e.actionNote || '',
+    }));
+
     taskDetails.push({
       drillTask: dt,
-      prerequisiteNames: prereqs.map((p) => p.name),
-      equipments: equips,
+      prerequisiteNames,
+      equipments,
     });
   }
 
