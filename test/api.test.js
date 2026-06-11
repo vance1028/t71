@@ -173,6 +173,7 @@ test('检查记录可按工程筛选', async () => {
 });
 
 test('未知接口返回 404', async () => {
-  const res = await request(app).get('/api/unknown');
+  const token = await tokenOf('inspector', 'inspect123');
+  const res = await request(app).get('/api/unknown').set('Authorization', `Bearer ${token}`);
   assert.strictEqual(res.status, 404);
 });
